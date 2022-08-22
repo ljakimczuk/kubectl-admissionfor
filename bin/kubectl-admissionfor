@@ -1,0 +1,267 @@
+#!/usr/bin/env bash
+set -e
+
+describe() {
+    echo -e "Creates a dummy validating admission controller that intercepts and logs requests for a given version and kind."
+}
+
+help() {
+  describe
+
+  echo -e "
+Creates a dummy NGINX-based admission controller that intercepts, logs and allways allows requests
+for a given Kubernetes object kind, version and group.
+
+The NGINX configuration contains also example of more sophisticated examples of validation logic,
+that could be used for testing or demonstration purposes.
+
+Usage:
+  admissionfor -k <kind> -v <version> [-g <group>]
+
+Examples:
+  # Creates fake admission controller for v1/Pods.
+  kubectl admissionfor -k pods -v v1
+
+  # Creates fake admission controller for v1/ConfigMaps.
+  kubectl admissionfor -k configmaps -v v1
+"
+
+  exit 1
+}
+
+namespace="kube-system"
+
+kind=""
+group=""
+version=""
+while getopts "hk:g:v:" opt; do
+    case "$opt" in
+    h)
+        help
+        ;;
+    k)  kind="$OPTARG"
+        ;;
+    g)  group="$OPTARG"
+        ;;
+    v)  version="$OPTARG"
+        ;;
+    esac
+done
+shift $((OPTIND-1))
+
+if [ -z $kind ] || [ -z $version ]
+then
+    help
+fi
+
+# Random suffix to satisfy multiple deployments
+suffix=$(openssl rand -hex 3)
+
+# Generate private key, but do not save it to a file,
+# instead save it to the environment variable
+private_key=$(openssl genrsa 2048 2>/dev/null)
+
+# Generate CSR out of the private key, again, without
+# saving to the file
+csr=$(openssl req -new -sha256 \
+    -key <(echo "$private_key") \
+    -subj "/CN=admission-fake-$suffix")
+
+# Generate certificate out of the CSR, certificate is valid for
+# arbitrary number of days and domains.
+certificate=$(openssl x509 -req \
+-signkey <(echo "$private_key") \
+-in <(echo "$csr") \
+-days 365 \
+-extfile <(printf "subjectAltName=DNS:localhost,DNS:admission-fake-$suffix,DNS:admission-fake-$suffix.$namespace,DNS:admission-fake-$suffix.$namespace.svc") \
+2>/dev/null)
+
+private_key_b64=$(echo "$private_key" | base64)
+certificate_b64=$(echo "$certificate" | base64)
+
+# Cleanup to make sure there are no leftovers in the cluster
+cleanup() {
+    kubectl delete validatingwebhookconfiguration admission-fake-$suffix 1>/dev/null 2>&1
+    kubectl wait --for=delete validatingwebhookconfiguration/admission-fake-$suffix 1>/dev/null 2>&1
+
+    kubectl delete svc -n $namespace admission-fake-$suffix 1>/dev/null 2>&1
+    kubectl wait --for=delete service/admission-fake-$suffix 1>/dev/null 2>&1
+
+    kubectl delete pod -n $namespace admission-fake-$suffix 1>/dev/null 2>&1
+    kubectl wait --for=delete pod/admission-fake-$suffix 1>/dev/null 2>&1
+
+    kubectl delete secret -n $namespace admission-fake-$suffix 1>/dev/null 2>&1
+    kubectl wait --for=delete secret/admission-fake-$suffix 1>/dev/null 2>&1
+
+    kubectl delete configmap -n $namespace admission-fake-$suffix 1>/dev/null 2>&1
+    kubectl wait --for=delete configmap/admission-fake-$suffix 1>/dev/null 2>&1
+}
+trap cleanup SIGINT EXIT ERR
+
+# Create Secret with a private key and certificate
+cat <<HERE | kubectl -n $namespace create -f 1>/dev/null 2>&1 -
+apiVersion: v1
+kind: Secret
+metadata:
+  name: admission-fake-$suffix
+  namespace: $namespace
+data:
+  debugger.crt: $certificate_b64
+  debugger.key: $private_key_b64
+HERE
+
+# Create ConfigMap with NGINX configuration
+cat <<HERE | kubectl -n $namespace create -f 1>/dev/null 2>&1 -
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: admission-fake-$suffix
+  namespace: $namespace
+data:
+  default.conf: |
+    log_format drop_body escape=none \$request_body;
+
+    server {
+        listen       443 ssl;
+        listen  [::]:443 ssl;
+        server_name  _;
+
+        ssl_certificate /etc/nginx/certificate/debugger.crt;
+        ssl_certificate_key /etc/nginx/certificate/debugger.key;
+
+        location / {
+          proxy_pass https://127.0.0.1:443/admission/log;
+        }
+
+        location /admission/log {
+            expires -1;
+
+            access_log /dev/stdout drop_body;
+
+            default_type text/html;
+
+            access_by_lua_block  {
+                local rev_allow = 'true'
+                local rev_code = 200
+                local rev_msg = ''
+
+                ngx.req.read_body()
+                local cjson = require "cjson"
+                local req_body = cjson.decode(ngx.req.get_body_data())
+
+                local req_uid = req_body.request.uid
+
+                -- Example of checking the name meets the expectation towards it
+                --
+                --[[
+                if not string.match(req_body.request.object.metadata.name,'nginx.*') then
+                    rev_allow = 'false'
+                    rev_code = 403
+                    rev_msg = 'No other name than \\\"nginx\\\" can be used.'
+                end
+                --]]
+
+                -- Example of checking each container meets expectations towards image used
+                --
+                --[[
+                for key,value in pairs(req_body.request.object.spec.containers) do
+                    if value.image ~= 'nginx:1.14.2' then
+                        rev_allow = 'false'
+                        rev_code = 403
+                        rev_msg = 'No other image than \\\"nginx:1.14.2\\\" can be used.'
+                    end
+                end
+                --]]
+
+                local rev_status = '{"code":'..rev_code..',"message":"'..rev_msg..'"}'
+                ngx.say('{"apiVersion":"admission.k8s.io/v1","kind":"AdmissionReview","response":{"uid":"'..req_uid..'","allowed":'..rev_allow..',"status":'..rev_status..'}}')
+
+                ngx.exit(ngx.HTTP_OK)
+            }
+        }
+    }
+HERE
+
+# Create Pod that rung NGINX
+cat <<HERE | kubectl -n $namespace create -f 1>/dev/null 2>&1 -
+apiVersion: v1
+kind: Pod
+metadata:
+  labels:
+    app.kubernetes.io/name: admission-fake-$suffix
+  name: admission-fake-$suffix
+  namespace: $namespace
+spec:
+  containers:
+  - image: openresty/openresty:1.21.4.1-3-alpine-apk
+    imagePullPolicy: Always
+    name: nginx
+    ports:
+    - containerPort: 443
+    volumeMounts:
+    - name: config
+      mountPath: /etc/nginx/conf.d
+    - name: cert
+      mountPath: /etc/nginx/certificate
+  volumes:
+  - name: config
+    configMap:
+      name: admission-fake-$suffix
+  - name: cert
+    secret:
+      secretName: admission-fake-$suffix
+HERE
+
+# Create Service that sits in front of the Pod
+cat <<HERE | kubectl -n $namespace create -f 1>/dev/null 2>&1 -
+apiVersion: v1
+kind: Service
+metadata:
+  name: admission-fake-$suffix
+spec:
+  selector:
+    app.kubernetes.io/name: admission-fake-$suffix
+  ports:
+  - protocol: TCP
+    port: 443
+    targetPort: 443
+HERE
+
+# Create ValidatingWebhookConfiguration to tell Kubernetes what to
+# send to the NGINX Pod
+cat <<HERE | kubectl -n $namespace create -f 1>/dev/null 2>&1 -
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingWebhookConfiguration
+metadata:
+  name: admission-fake-$suffix
+webhooks:
+- name: admission-fake-$suffix.giantswarm.io
+  rules:
+  - apiGroups:   ["$group"]
+    apiVersions: ["$version"]
+    operations:  ["CREATE"]
+    resources:   ["$kind"]
+  clientConfig:
+    service:
+      namespace: $namespace
+      name: admission-fake-$suffix
+      path: /admission/log
+      port: 443
+    caBundle: "$certificate_b64"
+  admissionReviewVersions: ["v1"]
+  sideEffects: None
+  timeoutSeconds: 5
+HERE
+
+# Print summary
+echo "Run the
+
+kubectl logs -n $namespace admission-fake-$suffix -f
+
+to get the objects being submitted."
+
+while :
+do
+    sleep 5 &
+    wait $!
+done
